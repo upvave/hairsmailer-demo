@@ -71,12 +71,12 @@ jobs:
         run: |
           scp -i ec2_key.pem -o StrictHostKeyChecking=no docker-compose.yml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}/
 
-      # - name: Write .env file on EC2
-      #   run: |
-      #     ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-      #       cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-      #       printf "%s" "${{ secrets.ENV_FILE }}" > .env
-      #     EOF
+      - name: Write .env file on EC2
+        run: |
+          ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
+            printf "%s" "${{ secrets.ENV_FILE }}" > .env
+          EOF
 
       - name: Write .env.docker file on EC2
         run: |
