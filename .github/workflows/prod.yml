@@ -1,4 +1,4 @@
-name: Build & Deploy (GHCR + EC2)
+name: Deploy in Production
 
 on:
   release:
@@ -15,6 +15,8 @@ concurrency:
 env:
   DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE || format('ghcr.io/{0}/{1}', github.repository_owner, github.event.repository.name) }}
   APP_NAME: ${{ vars.APP_NAME || github.event.repository.name }}
+  PORT: ${{ secrets.EC2_PROD_PORT ||'' }}
+  ENV_FILE: ${{ vars.PROD_ENV_FILE || secrets.PROD_ENV_FILE || '' }}
 
 jobs:
   build:
@@ -24,6 +26,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Create .env file
+        run: |
+          echo "${{ env.ENV_FILE }}" > .env
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -34,6 +39,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
       - name: Build & Push
         uses: docker/build-push-action@v6
         with:
@@ -42,21 +55,23 @@ jobs:
           tags: |
             ${{ env.DOCKER_IMAGE }}:latest
             ${{ env.DOCKER_IMAGE }}:${{ github.ref_name }}
-          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:latest
-          cache-to: type=inline
+          cache-from: |
+            type=registry,ref=${{ env.DOCKER_IMAGE }}:latest
+            type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
   deploy:
     name: Deploy on EC2
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout docker-compose.yml
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            docker-compose.yml
-          sparse-checkout-cone-mode: false
-
       - name: Write SSH key
         shell: bash
         run: |
@@ -67,24 +82,30 @@ jobs:
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "mkdir -p /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}"
 
+      - name: Validate required variables
+        run: |
+          if [ -z "${{ env.PORT }}" ]; then
+            echo "Error: PORT is not set"
+            exit 1
+          fi
+
+      - name: Create docker-compose.yml
+        run: |
+          cat > docker-compose.yml << EOF
+          services:
+            app:
+              image: ${{ env.DOCKER_IMAGE }}:latest
+              container_name: ${{ env.APP_NAME }}
+              restart: unless-stopped
+              ports:
+                - "${{ env.PORT }}:3000"
+              environment:
+                - NODE_ENV=production
+          EOF
+
       - name: Copy docker-compose.yml to EC2
         run: |
           scp -i ec2_key.pem -o StrictHostKeyChecking=no docker-compose.yml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}/
-
-      - name: Write .env file on EC2
-        run: |
-          ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            printf "%s" "${{ secrets.ENV_FILE }}" > .env
-          EOF
-
-      - name: Write .env.docker file on EC2
-        run: |
-          ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
-            cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            printf "DOCKER_IMAGE=%s:latest\n" "${{ env.DOCKER_IMAGE }}" > .env.docker
-            printf "CONTAINER_NAME=%s\n" "${{ env.APP_NAME }}" >> .env.docker
-          EOF
 
       - name: Login to GHCR on EC2
         run: |
@@ -96,28 +117,28 @@ jobs:
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            docker compose --env-file .env.docker pull
+            docker compose pull
           EOF
 
       - name: Stop old containers
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            docker compose --env-file .env.docker down || true
+            docker compose down || true
           EOF
 
       - name: Start containers
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            docker compose --env-file .env.docker up -d
+            docker compose up -d
           EOF
 
       - name: Check container status
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             cd /home/${{ secrets.EC2_USER }}/apps/${{ env.APP_NAME }}
-            docker compose --env-file .env.docker ps
+            docker compose ps
           EOF
 
       - name: Cleanup unused images
@@ -125,7 +146,7 @@ jobs:
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
             docker image prune -f
           EOF
-      
+
       - name: Cleanup stopped containers
         run: |
           ssh -i ec2_key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
